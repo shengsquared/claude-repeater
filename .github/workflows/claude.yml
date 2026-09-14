@@ -12,7 +12,7 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     env:
-      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.VARS_PAT }}
     steps:
       - name: Determine whether to ping now, wait, or skip
         id: check
