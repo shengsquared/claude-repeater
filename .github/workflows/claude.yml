@@ -2,12 +2,63 @@ name: Claude repeater
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 5,10,15,20 * * *'
+    - cron: '0 3,8,13,18 * * *'
+      timezone: 'Europe/Madrid'
+
+permissions:
+  actions: write
+
 jobs:
   ping:
     runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - run: npm install -g @anthropic-ai/claude-code
-      - run: claude -p "hi" --model claude-haiku-4-5-20251001 --output-format json
+      - name: Determine whether to ping now, wait, or skip
+        id: check
+        run: |
+          threshold=18010   # 5h00m10s
+          sanity_cap=604800 # 7 days — if last-ping state is this old, something's broken; force a ping
+          now=$(date +%s)
+          last=$(gh variable get LAST_PING_EPOCH --repo "${{ github.repository }}" 2>/dev/null || echo 0)
+          elapsed=$(( now - last ))
+          echo "Elapsed since last real ping: ${elapsed}s"
+
+          if [ "$elapsed" -ge "$threshold" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should_ping=true" >> "$GITHUB_OUTPUT"
+            echo "wait_seconds=0" >> "$GITHUB_OUTPUT"
+          elif [ "$elapsed" -lt 0 ] || [ "$elapsed" -ge "$sanity_cap" ]; then
+            echo "LAST_PING_EPOCH looks broken (elapsed=${elapsed}s) — forcing a ping to self-heal."
+            echo "should_ping=true" >> "$GITHUB_OUTPUT"
+            echo "wait_seconds=0" >> "$GITHUB_OUTPUT"
+          else
+            deficit=$(( threshold - elapsed ))
+            echo "Short by ${deficit}s — waiting it out instead of skipping this cycle."
+            echo "should_ping=true" >> "$GITHUB_OUTPUT"
+            echo "wait_seconds=$deficit" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Ping Claude and record timestamp
+        if: steps.check.outputs.should_ping == 'true'
+        run: |
+          if [ "${{ steps.check.outputs.wait_seconds }}" -gt 0 ]; then
+            sleep "${{ steps.check.outputs.wait_seconds }}"
+          fi
+          npm install -g @anthropic-ai/claude-code
+          for attempt in 1 2 3 4 5; do
+            status=$(curl -s https://anthropic.statuspage.io/api/v2/status.json | jq -r '.status.indicator')
+            if [ "$status" = "none" ]; then
+              if claude -p "hi" --model claude-haiku-4-5-20251001 --output-format json; then
+                gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"
+                exit 0
+              fi
+            else
+              echo "Anthropic status: $status — waiting before retry $attempt/5"
+            fi
+            sleep 60
+          done
+          echo "All 5 attempts failed — leaving LAST_PING_EPOCH untouched."
+          exit 1
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          MAX_THINKING_TOKENS: "0"
