@@ -49,9 +49,14 @@ jobs:
             status=$(curl -s https://anthropic.statuspage.io/api/v2/status.json | jq -r '.status.indicator' 2>/dev/null || echo "unknown")
             echo "Attempt ${attempt}/5 — Anthropic status: ${status}"
             if claude -p "hi" --model claude-haiku-4-5-20251001 --output-format json; then
-              gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"
+            if gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"; then
+              echo "Timestamp recorded successfully."
               exit 0
+            else
+              echo "Ping succeeded but writing LAST_PING_EPOCH FAILED — check repo permissions (Settings > Actions > General > Workflow permissions)."
+              exit 1
             fi
+          fi
             echo "Ping attempt ${attempt} failed — retrying in 60s"
             sleep 60
           done
