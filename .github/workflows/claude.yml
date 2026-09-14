@@ -2,7 +2,7 @@ name: Claude repeater
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 3,8,13,18 * * *'
+    - cron: '59 2,7,12,17 * * *'
       timezone: 'Europe/Madrid'
 
 permissions:
@@ -46,15 +46,13 @@ jobs:
           fi
           npm install -g @anthropic-ai/claude-code
           for attempt in 1 2 3 4 5; do
-            status=$(curl -s https://anthropic.statuspage.io/api/v2/status.json | jq -r '.status.indicator')
-            if [ "$status" = "none" ]; then
-              if claude -p "hi" --model claude-haiku-4-5-20251001 --output-format json; then
-                gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"
-                exit 0
-              fi
-            else
-              echo "Anthropic status: $status — waiting before retry $attempt/5"
+            status=$(curl -s https://anthropic.statuspage.io/api/v2/status.json | jq -r '.status.indicator' 2>/dev/null || echo "unknown")
+            echo "Attempt ${attempt}/5 — Anthropic status: ${status}"
+            if claude -p "hi" --model claude-haiku-4-5-20251001 --output-format json; then
+              gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"
+              exit 0
             fi
+            echo "Ping attempt ${attempt} failed — retrying in 60s"
             sleep 60
           done
           echo "All 5 attempts failed — leaving LAST_PING_EPOCH untouched."
