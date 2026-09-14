@@ -48,7 +48,7 @@ jobs:
           for attempt in 1 2 3 4 5; do
             status=$(curl -s https://anthropic.statuspage.io/api/v2/status.json | jq -r '.status.indicator' 2>/dev/null || echo "unknown")
             echo "Attempt ${attempt}/5 — Anthropic status: ${status}"
-            if claude -p "hi" --model claude-haiku-4-5-20251001 --max-turns 1 --max-budget-usd 0.003 --output-format json; then
+            if claude -p "hi" --model claude-haiku-4-5-20251001 --max-turns 1 --max-budget-usd 0.03 --output-format json; then
             if gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"; then
               echo "Timestamp recorded successfully."
               exit 0
