@@ -2,7 +2,7 @@ name: Claude repeater
 on:
   workflow_dispatch:
   schedule:
-    - cron: '59 2,7,12,17 * * *'
+    - cron: '59 2,7,12,17,22 * * *'
       timezone: 'Europe/Madrid'
 
 permissions:
