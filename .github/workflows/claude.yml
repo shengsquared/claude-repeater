@@ -1,17 +1,9 @@
 name: Claude repeater
+
 on:
   workflow_dispatch:
   schedule:
-    - cron: '59 2 * * *'
-      timezone: 'Europe/Madrid'
-    - cron: '59 7 * * *'
-      timezone: 'Europe/Madrid'
-    - cron: '59 12 * * *'
-      timezone: 'Europe/Madrid'
-    - cron: '59 17 * * *'
-      timezone: 'Europe/Madrid'
-permissions:
-  actions: write
+    - cron: '0,30 * * * *'  # poll every 30 min, UTC — timing precision comes from the job, not from GitHub
 
 jobs:
   ping:
@@ -19,49 +11,59 @@ jobs:
     env:
       GH_TOKEN: ${{ secrets.VARS_PAT }}
     steps:
-      - name: Determine whether to ping now, wait, or skip
+      - name: Decide whether this poll owes a ping
         id: check
         run: |
-          threshold=18010   # 5h00m10s
-          sanity_cap=604800 # 7 days — if last-ping state is this old, something's broken; force a ping
+          threshold=18010     # 5h00m10s — hard floor between pings
+          sanity_cap=604800   # 7 days — broken state, force a ping
           now=$(date +%s)
           last=$(gh variable get LAST_PING_EPOCH --repo "${{ github.repository }}" 2>/dev/null || echo 0)
           elapsed=$(( now - last ))
-          echo "Elapsed since last real ping: ${elapsed}s"
 
-          if [ "$elapsed" -ge "$threshold" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          # Most recent Madrid-local target time that has already passed
+          best=0
+          for d in 0 1; do
+            day=$(TZ=Europe/Madrid date -d "-${d} day" +%Y-%m-%d)
+            for h in 03 08 13 18; do
+              t=$(TZ=Europe/Madrid date -d "${day} ${h}:00:00" +%s)
+              if [ "$t" -le "$now" ] && [ "$t" -gt "$best" ]; then best=$t; fi
+            done
+          done
+
+          echo "Madrid now: $(TZ=Europe/Madrid date '+%Y-%m-%d %H:%M %Z')"
+          echo "Most recent target passed: $(TZ=Europe/Madrid date -d "@${best}" '+%H:%M')"
+          echo "Elapsed since last ping: ${elapsed}s"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual run — pinging."
             echo "should_ping=true" >> "$GITHUB_OUTPUT"
-            echo "wait_seconds=0" >> "$GITHUB_OUTPUT"
           elif [ "$elapsed" -lt 0 ] || [ "$elapsed" -ge "$sanity_cap" ]; then
-            echo "LAST_PING_EPOCH looks broken (elapsed=${elapsed}s) — forcing a ping to self-heal."
+            echo "LAST_PING_EPOCH looks broken — forcing a ping to self-heal."
             echo "should_ping=true" >> "$GITHUB_OUTPUT"
-            echo "wait_seconds=0" >> "$GITHUB_OUTPUT"
+          elif [ "$last" -lt "$best" ] && [ "$elapsed" -ge "$threshold" ]; then
+            echo "Target passed and no ping since — pinging."
+            echo "should_ping=true" >> "$GITHUB_OUTPUT"
           else
-            deficit=$(( threshold - elapsed ))
-            echo "Short by ${deficit}s — waiting it out instead of skipping this cycle."
-            echo "should_ping=true" >> "$GITHUB_OUTPUT"
-            echo "wait_seconds=$deficit" >> "$GITHUB_OUTPUT"
+            echo "Nothing owed this poll — skipping."
+            echo "should_ping=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Ping Claude and record timestamp
         if: steps.check.outputs.should_ping == 'true'
         run: |
-          if [ "${{ steps.check.outputs.wait_seconds }}" -gt 0 ]; then
-            sleep "${{ steps.check.outputs.wait_seconds }}"
-          fi
           npm install -g @anthropic-ai/claude-code
           for attempt in 1 2 3 4 5; do
             status=$(curl -s https://anthropic.statuspage.io/api/v2/status.json | jq -r '.status.indicator' 2>/dev/null || echo "unknown")
             echo "Attempt ${attempt}/5 — Anthropic status: ${status}"
             if claude -p "hi" --model claude-haiku-4-5-20251001 --max-turns 1 --max-budget-usd 0.03 --output-format json; then
-            if gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"; then
-              echo "Timestamp recorded successfully."
-              exit 0
-            else
-              echo "Ping succeeded but writing LAST_PING_EPOCH FAILED — check repo permissions (Settings > Actions > General > Workflow permissions)."
-              exit 1
+              if gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"; then
+                echo "Timestamp recorded successfully."
+                exit 0
+              else
+                echo "Ping succeeded but writing LAST_PING_EPOCH FAILED — check VARS_PAT is valid and has Variables: Read and write."
+                exit 1
+              fi
             fi
-          fi
             echo "Ping attempt ${attempt} failed — retrying in 60s"
             sleep 60
           done
