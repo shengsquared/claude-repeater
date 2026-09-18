@@ -45,19 +45,22 @@ immediately instead of idling until the next one.
 
 ## State
 
-The last ping's timestamp lives in the Actions cache, keyed `ping-state-*`.
+There is no state store. "When did we last ping?" is answered by reading this
+workflow's own run history for the newest run whose `Ping Claude` step
+succeeded. Nothing is written, so nothing can go stale, get corrupted, or
+expire.
 
-It used to live in an Actions Variable, which needed a fine-grained PAT, because
-the built-in `GITHUB_TOKEN` structurally cannot write Variables. That PAT
-expired and returned `401 Bad credentials`, which failed every run red — and
-worse, silently disabled all scheduling, because the unreadable variable made
-the job think its state was corrupt and ping on every single poll. The cache
-needs no credential beyond the built-in token, so that failure mode is gone.
+State used to live in an Actions Variable, which needed a fine-grained PAT,
+because the built-in `GITHUB_TOKEN` structurally cannot write Variables. That
+PAT expired and returned `401 Bad credentials`, which failed every run red —
+and, worse, silently disabled all scheduling, because the unreadable variable
+made the job believe its state was corrupt and ping on every single poll. The
+run history needs only `actions: read` on the built-in token.
 
 **No PAT is required any more.** `VARS_PAT` can be deleted.
 
-A missing cache entry degrades safely: the job pings at the next anchor and
-starts recording again.
+The workflow also uses no third-party actions at all, which keeps it working
+under any repository setting that restricts which actions may run.
 
 ## Secrets
 

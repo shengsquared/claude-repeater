@@ -6,14 +6,14 @@ name: Claude repeater
 # late (8/8 samples), and dropped ~90% of a '0,30 * * * *' cron. The `timezone:`
 # field was also ignored and the expression executed as plain UTC. So cron is
 # treated here as nothing more than "wake a runner up sometime" — the runner
-# then sleeps until the real Madrid-local target and pings on the second.
+# then sleeps until the real Madrid-local anchor and pings on the second.
 on:
   workflow_dispatch:
   schedule:
     - cron: '23 * * * *'   # hourly, off-peak minute; late/dropped fires are expected and absorbed
 
 permissions:
-  actions: read     # to see whether another run is already waiting
+  actions: read     # read this workflow's own run history — that is where state lives
   contents: read
 
 jobs:
@@ -29,42 +29,35 @@ jobs:
       TARGETS: "03:00 08:05 13:10 18:15"
 
     steps:
-      - name: Skip if another run is already waiting
-        id: solo
+      - name: Work out when to ping, then wait for it
+        id: plan
         run: |
+          set -u
+          floor=18000   # 5h — a message sooner than this lands inside the still-open window
+
+          # Another run already awake means it is the one holding the next anchor.
           others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml \
                      --status in_progress --json databaseId -q '.[].databaseId' \
                    | grep -v "^${GITHUB_RUN_ID}$" || true)
           if [ -n "$others" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            echo "Run(s) already in flight: $others — nothing to do."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "go=true" >> "$GITHUB_OUTPUT"
+            echo "Already in flight: $(echo "$others" | tr '\n' ' ')— nothing to do."
+            echo "ping=false" >> "$GITHUB_OUTPUT"; exit 0
           fi
 
-      - name: Restore last-ping timestamp
-        if: steps.solo.outputs.go == 'true'
-        uses: actions/cache/restore@v4
-        with:
-          path: .ping-state
-          key: ping-state-${{ github.run_id }}
-          restore-keys: ping-state-
+          # State is the run history itself: the newest run whose "Ping Claude"
+          # step actually succeeded. Nothing to store, nothing to corrupt, and no
+          # credential beyond the built-in token.
+          last=0
+          for id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml \
+                        --limit 15 --json databaseId -q '.[].databaseId' \
+                      | grep -v "^${GITHUB_RUN_ID}$"); do
+            t=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                  -q '.jobs[].steps[] | select(.name=="Ping Claude" and .conclusion=="success") | .completed_at' \
+                  2>/dev/null | head -1)
+            if [ -n "$t" ]; then last=$(date -d "$t" +%s); break; fi
+          done
 
-      - name: Work out when to ping, then wait for it
-        id: plan
-        if: steps.solo.outputs.go == 'true'
-        run: |
-          set -u
-          floor=18000                       # 5h — a message sooner than this lands inside the open window
           now=$(date +%s)
-          last=$(cat .ping-state 2>/dev/null | tr -cd '0-9')
-          last=${last:-0}
-          # A timestamp in the future means a corrupt cache entry. Left alone it
-          # would wedge the workflow forever, since every floor check would fail.
-          if [ "$last" -gt "$now" ]; then
-            echo "Cached timestamp is in the future — discarding it."
-            last=0
-          fi
 
           # Absolute epochs for every anchor across yesterday/today/tomorrow, so
           # "previous" and "next" both resolve correctly across midnight and DST.
@@ -80,22 +73,26 @@ jobs:
           done
 
           echo "Madrid now      : $(TZ=Europe/Madrid date '+%Y-%m-%d %H:%M:%S %Z')"
-          echo "Last ping       : $( [ "$last" -gt 0 ] && TZ=Europe/Madrid date -d "@$last" '+%Y-%m-%d %H:%M %Z' || echo 'none recorded' )"
+          if [ "$last" -gt 0 ]; then
+            echo "Last ping       : $(TZ=Europe/Madrid date -d "@$last" '+%Y-%m-%d %H:%M %Z')"
+          else
+            echo "Last ping       : none found in recent history"
+          fi
           echo "Previous anchor : $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M')"
           echo "Next anchor     : $(TZ=Europe/Madrid date -d "@$next" '+%H:%M')"
 
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
             echo "Manual run — pinging now."
           elif [ "$last" -lt "$prev" ] && [ $(( now - last )) -ge "$floor" ]; then
-            # An anchor went by unserved: GitHub delivered this run late. Catch up
-            # immediately rather than idling until the next one.
+            # An anchor went by unserved, i.e. GitHub delivered this run late.
+            # Catch up now rather than idling until the next one.
             echo "Anchor $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M') passed unserved — catching up now."
           else
             wait=$(( next - now ))
             echo "Nothing owed. Sleeping ${wait}s until $(TZ=Europe/Madrid date -d "@$next" '+%H:%M %Z')."
             sleep "$wait"
-            # Re-check the floor at wake-up: a ping sooner than 5h after the last
-            # one would be swallowed by the still-open window.
+            # Re-check the floor on waking: a ping sooner than 5h after the last
+            # one would be swallowed by the window that is still open.
             gap=$(( $(date +%s) - last ))
             if [ "$last" -gt 0 ] && [ "$gap" -lt "$floor" ]; then
               echo "Only ${gap}s since the last ping — window still open, skipping."
@@ -115,7 +112,6 @@ jobs:
             echo "Attempt ${attempt}/5 at $(TZ=Europe/Madrid date '+%H:%M:%S %Z')"
             if claude -p "hi" --model claude-haiku-4-5-20251001 \
                  --max-turns 1 --max-budget-usd 0.03 --output-format json; then
-              date +%s > .ping-state
               echo "Window opened at $(TZ=Europe/Madrid date '+%H:%M:%S %Z')."
               exit 0
             fi
@@ -124,10 +120,3 @@ jobs:
           done
           echo "All 5 attempts failed."
           exit 1
-
-      - name: Save last-ping timestamp
-        if: steps.plan.outputs.ping == 'true' && success()
-        uses: actions/cache/save@v4
-        with:
-          path: .ping-state
-          key: ping-state-${{ github.run_id }}
