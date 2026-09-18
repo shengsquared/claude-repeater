@@ -22,11 +22,18 @@ jobs:
     timeout-minutes: 340   # longest possible wait (5h05m) + overhead; hosted-runner cap is 6h
     env:
       GH_TOKEN: ${{ github.token }}
-      # Madrid-local window anchors, spaced 5h05m so a new 5h window can always
-      # open even with a few minutes of execution jitter. Exactly-5h spacing
-      # cannot work: each ping lands a moment late, so the next window start is
-      # pushed past the next anchor and the schedule walks forward every cycle.
-      TARGETS: "03:00 08:05 13:10 18:15"
+      # Madrid-local window anchors, spaced 5h01m. Exactly-5h spacing cannot
+      # work: each ping lands a moment late, so the next window start is pushed
+      # past the next anchor and the schedule walks forward every cycle.
+      #
+      # The extra minute is the safety margin, and it is deliberately not
+      # smaller. A ping that lands inside a still-open window does not open a
+      # new one, but `claude -p` still succeeds and the run still goes green, so
+      # the miss is invisible and the next target is then computed from an
+      # anchor that never existed. A margin of seconds only survives if the
+      # window is exactly 5h from the message; a minute also survives the window
+      # end rounding up to the next minute.
+      TARGETS: "03:00 08:01 13:02 18:03"
 
     steps:
       - name: Work out when to ping, then wait for it

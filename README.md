@@ -11,15 +11,26 @@ token.
 
 ## Anchors
 
-Madrid local time: **03:00, 08:05, 13:10, 18:15**.
+Madrid local time: **03:00, 08:01, 13:02, 18:03** — 5h01m apart.
 
-The five-minute stagger is deliberate. Windows are five hours long, so a new one
-can only open five hours after the last message. Anchors spaced exactly five
-hours apart therefore cannot hold: every ping lands a second or two late, which
-pushes the next window start just past the next anchor, and the whole schedule
-walks forward — half an hour per cycle in the version this replaced, so the
-18:00 anchor was firing at 19:30. Five hours and five minutes absorbs the
-jitter. Coverage runs 03:00 to 23:15 with four five-minute seams.
+The stagger is deliberate. Windows are five hours long, so a new one can only
+open five hours after the last message. Anchors spaced exactly five hours apart
+therefore cannot hold: every ping lands a second or two late, which pushes the
+next window start just past the next anchor, and the whole schedule walks
+forward — half an hour per cycle in the version this replaced, so the 18:00
+anchor was firing at 19:30.
+
+The extra minute is the safety margin, and it is deliberately not shorter. A
+ping that lands inside a window that is still open does not start a new one, but
+`claude -p` still succeeds and the run still goes green, so the miss leaves no
+trace and the following target then gets computed from an anchor that never
+existed. Ten seconds of margin survives only if a window is exactly five hours
+from the message; a minute also survives the window end rounding up. The cost of
+the larger margin is three minutes of spread across the whole day.
+
+Coverage runs 03:00 to 23:03 with three one-minute seams. Gaps stay above five
+hours across both DST transitions — spring-forward shortens the overnight gap to
+7h57m, which is still ample.
 
 ## Why the cron expression is meaningless
 
