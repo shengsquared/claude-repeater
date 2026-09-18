@@ -11,7 +11,7 @@ token.
 
 ## Anchors
 
-Madrid local time: **03:00, 08:01, 13:02, 18:03** — 5h01m apart.
+European local time: **03:00, 08:01, 13:02, 18:03** — 5h01m apart.
 
 The stagger is deliberate. Windows are five hours long, so a new one can only
 open five hours after the last message. Anchors spaced exactly five hours apart
