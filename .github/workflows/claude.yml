@@ -1,74 +1,133 @@
 name: Claude repeater
 
+# Timing does NOT come from this cron.
+#
+# Measured on this repo: GitHub's scheduler delivered scheduled runs 1-3 hours
+# late (8/8 samples), and dropped ~90% of a '0,30 * * * *' cron. The `timezone:`
+# field was also ignored and the expression executed as plain UTC. So cron is
+# treated here as nothing more than "wake a runner up sometime" — the runner
+# then sleeps until the real Madrid-local target and pings on the second.
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0,30 * * * *'  # poll every 30 min, UTC — timing precision comes from the job, not from GitHub
+    - cron: '23 * * * *'   # hourly, off-peak minute; late/dropped fires are expected and absorbed
+
+permissions:
+  actions: read     # to see whether another run is already waiting
+  contents: read
 
 jobs:
   ping:
     runs-on: ubuntu-latest
+    timeout-minutes: 340   # longest possible wait (5h05m) + overhead; hosted-runner cap is 6h
     env:
-      GH_TOKEN: ${{ secrets.VARS_PAT }}
-    steps:
-      - name: Decide whether this poll owes a ping
-        id: check
-        run: |
-          threshold=18010     # 5h00m10s — hard floor between pings
-          sanity_cap=604800   # 7 days — broken state, force a ping
-          now=$(date +%s)
-          last=$(gh variable get LAST_PING_EPOCH --repo "${{ github.repository }}" 2>/dev/null || echo 0)
-          elapsed=$(( now - last ))
+      GH_TOKEN: ${{ github.token }}
+      # Madrid-local window anchors, spaced 5h05m so a new 5h window can always
+      # open even with a few minutes of execution jitter. Exactly-5h spacing
+      # cannot work: each ping lands a moment late, so the next window start is
+      # pushed past the next anchor and the schedule walks forward every cycle.
+      TARGETS: "03:00 08:05 13:10 18:15"
 
-          # Most recent Madrid-local target time that has already passed
-          best=0
-          for d in 0 1; do
-            day=$(TZ=Europe/Madrid date -d "-${d} day" +%Y-%m-%d)
-            for h in 03 08 13 18; do
-              t=$(TZ=Europe/Madrid date -d "${day} ${h}:00:00" +%s)
-              if [ "$t" -le "$now" ] && [ "$t" -gt "$best" ]; then best=$t; fi
+    steps:
+      - name: Skip if another run is already waiting
+        id: solo
+        run: |
+          others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml \
+                     --status in_progress --json databaseId -q '.[].databaseId' \
+                   | grep -v "^${GITHUB_RUN_ID}$" || true)
+          if [ -n "$others" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "Run(s) already in flight: $others — nothing to do."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Restore last-ping timestamp
+        if: steps.solo.outputs.go == 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: .ping-state
+          key: ping-state-${{ github.run_id }}
+          restore-keys: ping-state-
+
+      - name: Work out when to ping, then wait for it
+        id: plan
+        if: steps.solo.outputs.go == 'true'
+        run: |
+          set -u
+          floor=18000                       # 5h — a message sooner than this lands inside the open window
+          now=$(date +%s)
+          last=$(cat .ping-state 2>/dev/null | tr -cd '0-9')
+          last=${last:-0}
+          # A timestamp in the future means a corrupt cache entry. Left alone it
+          # would wedge the workflow forever, since every floor check would fail.
+          if [ "$last" -gt "$now" ]; then
+            echo "Cached timestamp is in the future — discarding it."
+            last=0
+          fi
+
+          # Absolute epochs for every anchor across yesterday/today/tomorrow, so
+          # "previous" and "next" both resolve correctly across midnight and DST.
+          prev=0; next=0
+          for d in "-1 day" "now" "+1 day"; do
+            day=$(TZ=Europe/Madrid date -d "$d" +%Y-%m-%d)
+            for hm in $TARGETS; do
+              t=$(TZ=Europe/Madrid date -d "$day $hm:00" +%s)
+              if   [ "$t" -le "$now" ] && { [ "$prev" -eq 0 ] || [ "$t" -gt "$prev" ]; }; then prev=$t
+              elif [ "$t" -gt "$now" ] && { [ "$next" -eq 0 ] || [ "$t" -lt "$next" ]; }; then next=$t
+              fi
             done
           done
 
-          echo "Madrid now: $(TZ=Europe/Madrid date '+%Y-%m-%d %H:%M %Z')"
-          echo "Most recent target passed: $(TZ=Europe/Madrid date -d "@${best}" '+%H:%M')"
-          echo "Elapsed since last ping: ${elapsed}s"
+          echo "Madrid now      : $(TZ=Europe/Madrid date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Last ping       : $( [ "$last" -gt 0 ] && TZ=Europe/Madrid date -d "@$last" '+%Y-%m-%d %H:%M %Z' || echo 'none recorded' )"
+          echo "Previous anchor : $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M')"
+          echo "Next anchor     : $(TZ=Europe/Madrid date -d "@$next" '+%H:%M')"
 
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "Manual run — pinging."
-            echo "should_ping=true" >> "$GITHUB_OUTPUT"
-          elif [ "$elapsed" -lt 0 ] || [ "$elapsed" -ge "$sanity_cap" ]; then
-            echo "LAST_PING_EPOCH looks broken — forcing a ping to self-heal."
-            echo "should_ping=true" >> "$GITHUB_OUTPUT"
-          elif [ "$last" -lt "$best" ] && [ "$elapsed" -ge "$threshold" ]; then
-            echo "Target passed and no ping since — pinging."
-            echo "should_ping=true" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "Manual run — pinging now."
+          elif [ "$last" -lt "$prev" ] && [ $(( now - last )) -ge "$floor" ]; then
+            # An anchor went by unserved: GitHub delivered this run late. Catch up
+            # immediately rather than idling until the next one.
+            echo "Anchor $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M') passed unserved — catching up now."
           else
-            echo "Nothing owed this poll — skipping."
-            echo "should_ping=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Ping Claude and record timestamp
-        if: steps.check.outputs.should_ping == 'true'
-        run: |
-          npm install -g @anthropic-ai/claude-code
-          for attempt in 1 2 3 4 5; do
-            status=$(curl -s https://anthropic.statuspage.io/api/v2/status.json | jq -r '.status.indicator' 2>/dev/null || echo "unknown")
-            echo "Attempt ${attempt}/5 — Anthropic status: ${status}"
-            if claude -p "hi" --model claude-haiku-4-5-20251001 --max-turns 1 --max-budget-usd 0.03 --output-format json; then
-              if gh variable set LAST_PING_EPOCH --repo "${{ github.repository }}" --body "$(date +%s)"; then
-                echo "Timestamp recorded successfully."
-                exit 0
-              else
-                echo "Ping succeeded but writing LAST_PING_EPOCH FAILED — check VARS_PAT is valid and has Variables: Read and write."
-                exit 1
-              fi
+            wait=$(( next - now ))
+            echo "Nothing owed. Sleeping ${wait}s until $(TZ=Europe/Madrid date -d "@$next" '+%H:%M %Z')."
+            sleep "$wait"
+            # Re-check the floor at wake-up: a ping sooner than 5h after the last
+            # one would be swallowed by the still-open window.
+            gap=$(( $(date +%s) - last ))
+            if [ "$last" -gt 0 ] && [ "$gap" -lt "$floor" ]; then
+              echo "Only ${gap}s since the last ping — window still open, skipping."
+              echo "ping=false" >> "$GITHUB_OUTPUT"; exit 0
             fi
-            echo "Ping attempt ${attempt} failed — retrying in 60s"
-            sleep 60
-          done
-          echo "All 5 attempts failed — leaving LAST_PING_EPOCH untouched."
-          exit 1
+          fi
+          echo "ping=true" >> "$GITHUB_OUTPUT"
+
+      - name: Ping Claude
+        if: steps.plan.outputs.ping == 'true'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MAX_THINKING_TOKENS: "0"
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          for attempt in 1 2 3 4 5; do
+            echo "Attempt ${attempt}/5 at $(TZ=Europe/Madrid date '+%H:%M:%S %Z')"
+            if claude -p "hi" --model claude-haiku-4-5-20251001 \
+                 --max-turns 1 --max-budget-usd 0.03 --output-format json; then
+              date +%s > .ping-state
+              echo "Window opened at $(TZ=Europe/Madrid date '+%H:%M:%S %Z')."
+              exit 0
+            fi
+            echo "Attempt ${attempt} failed — retrying in 60s"
+            sleep 60
+          done
+          echo "All 5 attempts failed."
+          exit 1
+
+      - name: Save last-ping timestamp
+        if: steps.plan.outputs.ping == 'true' && success()
+        uses: actions/cache/save@v4
+        with:
+          path: .ping-state
+          key: ping-state-${{ github.run_id }}
