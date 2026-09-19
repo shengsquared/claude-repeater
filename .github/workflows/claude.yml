@@ -69,9 +69,13 @@ jobs:
 
           # Absolute epochs for every anchor across yesterday/today/tomorrow, so
           # "previous" and "next" both resolve correctly across midnight and DST.
+          # The day set is derived from $now rather than read from the clock
+          # again, so a run started a moment before midnight cannot end up with
+          # a "now" and a day window on opposite sides of the date change.
           prev=0; next=0
-          for d in "-1 day" "now" "+1 day"; do
-            day=$(TZ=Europe/Madrid date -d "$d" +%Y-%m-%d)
+          today=$(TZ=Europe/Madrid date -d "@$now" +%Y-%m-%d)
+          for d in "-1 day" "+0 day" "+1 day"; do
+            day=$(date -d "$today $d" +%Y-%m-%d)
             for hm in $TARGETS; do
               t=$(TZ=Europe/Madrid date -d "$day $hm:00" +%s)
               if   [ "$t" -le "$now" ] && { [ "$prev" -eq 0 ] || [ "$t" -gt "$prev" ]; }; then prev=$t
