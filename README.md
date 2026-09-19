@@ -32,6 +32,34 @@ Coverage runs 03:00 to 23:03 with three one-minute seams. Gaps stay above five
 hours across both DST transitions — spring-forward shortens the overnight gap to
 7h57m, which is still ample.
 
+## Missing an anchor vs. drifting off it
+
+Each run aims at `max(next anchor, last ping + 5h)`, never earlier. Both halves
+matter. A ping before the five hours are up lands inside the open window and
+opens nothing; an anchor abandoned because it sits a couple of minutes inside
+that floor costs a whole five-hour slot. Waiting the extra minutes is always the
+better trade, so the job waits rather than skipping.
+
+The cost is that a ping which lands late drags the following ones with it: the
+anchors are only 5h01m apart, so any lateness beyond a minute means the floor,
+not the anchor, sets the next target. That drift does not accumulate. The
+overnight gap is 8h57m, far longer than the floor, so the first anchor of each
+day is reached on time regardless of how ragged the previous day was — 03:00
+re-acquires the phase and the rest of the day follows it.
+
+## The overnight gap cannot be slept through
+
+A job may live six hours at most on a hosted runner, and the gap from 18:03 to
+03:00 is 8h57m. A run delivered early in that gap therefore cannot wait it out.
+It exits immediately instead (`MAXWAIT`, 5h45m) and leaves 03:00 to a run
+delivered later in the night.
+
+This matters more than it sounds. A run that sleeps is holding the lock — every
+other run sees it in flight and exits at once. An earlier version sized the job
+timeout to the daytime anchor spacing and let evening runs sleep toward 03:00;
+they were killed at the timeout having pinged nothing, and blocked every other
+run for the 5h40m they spent dying.
+
 ## Why the cron expression is meaningless
 
 Measured on this repository, GitHub's scheduler is not a clock:
