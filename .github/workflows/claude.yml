@@ -19,7 +19,7 @@ permissions:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 340   # longest possible wait (5h05m) + overhead; hosted-runner cap is 6h
+    timeout-minutes: 355   # MAXWAIT (5h45m) + overhead, just under the 6h hosted-runner cap
     env:
       GH_TOKEN: ${{ github.token }}
       # Madrid-local window anchors, spaced 5h01m. Exactly-5h spacing cannot
@@ -41,6 +41,7 @@ jobs:
         run: |
           set -u
           floor=18000   # 5h — a message sooner than this lands inside the still-open window
+          maxwait=20700 # 5h45m — longest a job may sleep, under the 6h runner cap
 
           # Another run already awake means it is the one holding the next anchor.
           others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml \
@@ -68,9 +69,13 @@ jobs:
 
           # Absolute epochs for every anchor across yesterday/today/tomorrow, so
           # "previous" and "next" both resolve correctly across midnight and DST.
+          # The day set is derived from $now rather than read from the clock
+          # again, so a run started a moment before midnight cannot end up with
+          # a "now" and a day window on opposite sides of the date change.
           prev=0; next=0
-          for d in "-1 day" "now" "+1 day"; do
-            day=$(TZ=Europe/Madrid date -d "$d" +%Y-%m-%d)
+          today=$(TZ=Europe/Madrid date -d "@$now" +%Y-%m-%d)
+          for d in "-1 day" "+0 day" "+1 day"; do
+            day=$(date -d "$today $d" +%Y-%m-%d)
             for hm in $TARGETS; do
               t=$(TZ=Europe/Madrid date -d "$day $hm:00" +%s)
               if   [ "$t" -le "$now" ] && { [ "$prev" -eq 0 ] || [ "$t" -gt "$prev" ]; }; then prev=$t
@@ -88,24 +93,37 @@ jobs:
           echo "Previous anchor : $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M')"
           echo "Next anchor     : $(TZ=Europe/Madrid date -d "@$next" '+%H:%M')"
 
+          # A new window can only open once the last one has expired. Aim at the
+          # anchor, but never before that moment — a ping inside an open window
+          # does not start a new one, and skipping the anchor over a few minutes
+          # would forfeit the whole slot.
+          earliest=$(( last + floor ))
           if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            target=$now
             echo "Manual run — pinging now."
-          elif [ "$last" -lt "$prev" ] && [ $(( now - last )) -ge "$floor" ]; then
-            # An anchor went by unserved, i.e. GitHub delivered this run late.
-            # Catch up now rather than idling until the next one.
-            echo "Anchor $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M') passed unserved — catching up now."
+          elif [ "$last" -lt "$prev" ]; then
+            target=$now
+            if [ "$earliest" -gt "$target" ]; then target=$earliest; fi
+            echo "Anchor $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M') passed unserved — serving it at $(TZ=Europe/Madrid date -d "@$target" '+%H:%M:%S')."
           else
-            wait=$(( next - now ))
-            echo "Nothing owed. Sleeping ${wait}s until $(TZ=Europe/Madrid date -d "@$next" '+%H:%M %Z')."
-            sleep "$wait"
-            # Re-check the floor on waking: a ping sooner than 5h after the last
-            # one would be swallowed by the window that is still open.
-            gap=$(( $(date +%s) - last ))
-            if [ "$last" -gt 0 ] && [ "$gap" -lt "$floor" ]; then
-              echo "Only ${gap}s since the last ping — window still open, skipping."
-              echo "ping=false" >> "$GITHUB_OUTPUT"; exit 0
-            fi
+            target=$next
+            if [ "$earliest" -gt "$target" ]; then target=$earliest; fi
+            echo "Aiming at $(TZ=Europe/Madrid date -d "@$target" '+%H:%M:%S %Z')."
           fi
+
+          wait=$(( target - now ))
+          if [ "$wait" -lt 0 ]; then wait=0; fi
+
+          # The overnight gap (18:03 -> 03:00) is 8h57m, longer than a job may
+          # live, so a run delivered early in it cannot sleep the whole way.
+          # Exit cheaply and let a later-delivered run cover it, rather than
+          # sleeping into the timeout and holding the lock the whole time.
+          if [ "$wait" -gt "$maxwait" ]; then
+            echo "Target is ${wait}s out, beyond the ${maxwait}s a job can wait — leaving it to a later run."
+            echo "ping=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
           echo "ping=true" >> "$GITHUB_OUTPUT"
 
       - name: Ping Claude
