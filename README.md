@@ -3,116 +3,123 @@
 Opens Claude usage windows at chosen times of day instead of whenever you happen
 to send your first message.
 
-A window isn't on a fixed clock. It starts the moment you send a message and
-runs five hours from that timestamp. So "triggering a window at 08:05" just
-means guaranteeing a message goes out at 08:05. This repo sends that message: a
-one-word `claude -p "hi"` on Haiku, authenticated with a subscription OAuth
-token.
+A window is not on a fixed clock. It starts when you send a message and lasts
+five hours. So opening one at 08:01 means making sure a message goes out at
+08:01. This repo sends it: a one-word `claude -p "hi"` on Haiku, authenticated
+with a subscription OAuth token (`claude setup-token`).
 
 ## Anchors
 
-European local time: **03:00, 08:01, 13:02, 18:03** — 5h01m apart.
+Madrid local time: **03:00, 08:01, 13:02, 18:03**, 5h01m apart, then 8h57m
+overnight.
 
-The stagger is deliberate. Windows are five hours long, so a new one can only
-open five hours after the last message. Anchors spaced exactly five hours apart
-therefore cannot hold: every ping lands a second or two late, which pushes the
-next window start just past the next anchor, and the whole schedule walks
-forward — half an hour per cycle in the version this replaced, so the 18:00
-anchor was firing at 19:30.
-
-The extra minute is the safety margin, and it is deliberately not shorter. A
-ping that lands inside a window that is still open does not start a new one, but
+Exactly five hours apart cannot work. Every ping lands a second or two after its
+anchor, so the next window can only open a second or two after the next anchor,
+and the schedule walks forward. The extra minute is the margin. It is not
+smaller on purpose: a ping inside a window that is still open opens nothing, but
 `claude -p` still succeeds and the run still goes green, so the miss leaves no
-trace and the following target then gets computed from an anchor that never
-existed. Ten seconds of margin survives only if a window is exactly five hours
-from the message; a minute also survives the window end rounding up. The cost of
-the larger margin is three minutes of spread across the whole day.
+trace. Ten seconds of margin only survives if a window is exactly five hours
+from the message; a minute also survives the end rounding up.
 
-Coverage runs 03:00 to 23:03 with three one-minute seams. Gaps stay above five
-hours across both DST transitions — spring-forward shortens the overnight gap to
-7h57m, which is still ample.
+## How it fires: a relay
 
-## Missing an anchor vs. drifting off it
+GitHub's scheduler is not a clock. Measured on this repo over 21-28 Sep it
+delivered 4 to 7 of the 24 hourly runs it was asked for, often hours late, and
+the `timezone:` field is ignored. A run can only sleep to an anchor if one was
+delivered beforehand, and 7 of 32 anchors in that stretch had no run alive when
+they came, so they fired 2 minutes to 4h32m late.
 
-Each run aims at `max(next anchor, last ping + 5h)`, never earlier. Both halves
-matter. A ping before the five hours are up lands inside the open window and
-opens nothing; an anchor abandoned because it sits a couple of minutes inside
-that floor costs a whole five-hour slot. Waiting the extra minutes is always the
-better trade, so the job waits rather than skipping.
+So the workflow does not depend on the cron. Each run:
 
-The cost is that a ping which lands late drags the following ones with it: the
-anchors are only 5h01m apart, so any lateness beyond a minute means the floor,
-not the anchor, sets the next target. That drift does not accumulate. The
-overnight gap is 8h57m, far longer than the floor, so the first anchor of each
-day is reached on time regardless of how ragged the previous day was — 03:00
-re-acquires the phase and the rest of the day follows it.
+1. works out the next anchor, in `TZ=Europe/Madrid`, which reads system tzdata
+   and handles DST;
+2. sleeps to it, and sends the message on the second;
+3. **starts the next run itself** with `workflow_dispatch`, which is not subject
+   to the scheduler (events from the built-in token do not start new runs, except
+   this one).
 
-## The overnight gap cannot be slept through
+There is always a run alive, so delivery no longer matters. The hourly cron stays
+only as a restart if the relay breaks; its delivery time is irrelevant.
 
-A job may live six hours at most on a hosted runner, and the gap from 18:03 to
-03:00 is 8h57m. A run delivered early in that gap therefore cannot wait it out.
-It exits immediately instead (`MAXWAIT`, 5h45m) and leaves 03:00 to a run
-delivered later in the night.
+A job may live six hours and the overnight gap is 8h57m, so one run cannot sleep
+through it. Runs sleep at most 5h30m, then hand off, and the next run sleeps the
+rest. Each leg ends on an absolute target, so hand-off delay never accumulates.
+The 18:03 run hands off at 23:33 and the next one wakes for 03:00.
 
-This matters more than it sounds. A run that sleeps is holding the lock — every
-other run sees it in flight and exits at once. An earlier version sized the job
-timeout to the daytime anchor spacing and let evening runs sleep toward 03:00;
-they were killed at the timeout having pinged nothing, and blocked every other
-run for the 5h40m they spent dying.
+Cancelling the live run stops the relay. That is the off switch.
 
-## Why the cron expression is meaningless
+## Which anchor a run serves
 
-Measured on this repository, GitHub's scheduler is not a clock:
+A run serves the earliest anchor it can still serve within 90 minutes of its
+time, and pings at the latest of: the anchor, five hours after the last ping, and
+now.
 
-- Scheduled runs arrived **one to three hours late**, in all eight samples taken
-  against a four-anchor cron. Not one arrived early.
-- A `0,30 * * * *` cron delivered **four runs in twelve hours** instead of
-  twenty-four. High-frequency schedules get dropped; the old four-a-day cron was
-  delivered reliably.
-- The `timezone:` field was **ignored** and the expression executed as plain
-  UTC, which is why every run looked misaligned by exactly the UTC offset.
+- On time: a run that starts just after a ping sleeps to the next anchor.
+- A few minutes late: a ping five minutes past its anchor puts the five-hour
+  floor three minutes past the next one. That anchor is served at the floor, not
+  thrown away over three minutes.
+- Missed by up to 90 minutes: served now.
+- Missed by more: the slot is skipped and the run waits for the next anchor. A
+  ping at a useless hour would open a window nobody needs and push every later
+  anchor with it. On 28 Sep, catching up 13:02 at 17:34 cost the 18:03 anchor and
+  would have moved 03:00 to 03:34.
 
-None of that is fixable by writing a better cron expression. So the cron here is
-hourly and its firing time is treated as irrelevant — it exists only to get a
-runner started. Every timing decision happens inside the job, which computes the
-next anchor under `TZ=Europe/Madrid` (reading system tzdata, so DST is handled)
-and then **sleeps until it**. GitHub decides when the job starts; the job decides
-when the ping goes out.
-
-If a run is delivered after an anchor has already gone by unserved, it pings
-immediately instead of idling until the next one.
+Lateness therefore never cascades for more than a couple of anchors, and the
+overnight gap resets it.
 
 ## State
 
-There is no state store. "When did we last ping?" is answered by reading this
-workflow's own run history for the newest run whose `Ping Claude` step
-succeeded. Nothing is written, so nothing can go stale, get corrupted, or
-expire.
+There is no state store. "When did we last ping?" is the newest run of this
+workflow whose `Ping Claude` step succeeded, read from the run history. Nothing
+is written, so nothing goes stale, and no credential beyond the built-in token is
+needed. It used to be an Actions Variable, which needs a personal access token;
+that expired, returned `401`, and silently disabled all scheduling. `VARS_PAT`
+can be deleted.
 
-State used to live in an Actions Variable, which needed a fine-grained PAT,
-because the built-in `GITHUB_TOKEN` structurally cannot write Variables. That
-PAT expired and returned `401 Bad credentials`, which failed every run red —
-and, worse, silently disabled all scheduling, because the unreadable variable
-made the job believe its state was corrupt and ping on every single poll. The
-run history needs only `actions: read` on the built-in token.
+No third-party actions are used, so any restriction on which actions may run is
+irrelevant. (`actions/cache` was rejected at startup on this repo.)
 
-**No PAT is required any more.** `VARS_PAT` can be deleted.
+## One run holds the relay
 
-The workflow also uses no third-party actions at all, which keeps it working
-under any repository setting that restricts which actions may run.
+A scheduled run stands aside if any run is alive. A relay run waits up to two
+minutes for the run that started it to finish, and stands aside only for an
+older run that is still going. Two runs that start together resolve to the older.
+If two ever do sleep to the same anchor, the second ping lands inside the first
+window and does nothing, and the extra run stands down at the next hand-off.
 
-## Secrets
+A run also re-checks the history 30 seconds before its target. If a ping landed
+while it slept (a manual run, say), pinging would open nothing, so it replans.
 
-Only one: `CLAUDE_CODE_OAUTH_TOKEN`, from `claude setup-token`.
+## Operating it
 
-## The caveat that no code can catch
+- **Start or restart the relay:** Actions, *Claude repeater*, Run workflow, with
+  `chain` ticked. It waits for the next anchor. Leave `chain` off to ping
+  immediately instead.
+- **Stop it:** cancel the run that is in progress.
+- **Test it without spending anything:** run with `dry_run` ticked and
+  `hop_seconds` set to `90`. It plans, sleeps, and hands off every minute and a
+  half, and never calls Claude. Cancel it when done.
+- **Read a run:** the list shows when GitHub started the run, not when it pinged.
+  A run that starts at 13:36 and lasts 4h26m pinged at 18:03. Open the run and read
+  the `Ping Claude` step.
 
-This depends on headless `claude -p` usage drawing from the same session pool as
-interactive use. That is true today. But Anthropic built, priced, and announced
-a change moving non-interactive usage to a separate credit pool, emailed
-eligible users, then paused it the day it was due to ship, with no new date. If
-it resumes, every ping here keeps succeeding in the logs while doing nothing for
-your interactive windows.
+## Tests
 
-Nothing in this workflow can detect that. Checking `/usage` after a scheduled
-ping is the only way to know.
+`test/plan-test.sh` runs the Plan step of the workflow, verbatim, against a fake
+clock that advances when the script sleeps. Only `date`, `sleep`, `gh` and `npm`
+are stubbed. It covers steady state, both failures of 18-19 Sep, late delivery
+and its 90-minute boundary, the hop limit, manual and dry runs, the single-holder
+rules, a stray ping, midnight and both DST transitions. Deliberately breaking the
+workflow (dropping the floor, the hop limit, the wait for the parent) fails it.
+
+It cannot test that one run can start the next; that only exists on a real runner.
+Use the dry run above.
+
+## The caveat no code can catch
+
+All of this depends on headless `claude -p` usage drawing from the same session
+pool as interactive use. That is true today. Anthropic announced a change moving
+non-interactive usage to a separate credit pool and then paused it with no new
+date. If it resumes, every ping here keeps succeeding in the logs while doing
+nothing for your interactive windows. Nothing in this workflow can detect that.
+Checking `/usage` after a scheduled ping is the only way to know.
