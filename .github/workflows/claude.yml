@@ -1,138 +1,208 @@
 name: Claude repeater
 
-# Timing does NOT come from this cron.
+# A window opens when a message is sent and lasts five hours, so opening one at a
+# chosen time means sending a message at that time. This workflow does that at
+# four Madrid-local anchors a day (see TARGETS).
 #
-# Measured on this repo: GitHub's scheduler delivered scheduled runs 1-3 hours
-# late (8/8 samples), and dropped ~90% of a '0,30 * * * *' cron. The `timezone:`
-# field was also ignored and the expression executed as plain UTC. So cron is
-# treated here as nothing more than "wake a runner up sometime" — the runner
-# then sleeps until the real Madrid-local anchor and pings on the second.
+# It is a relay, not a cron job. GitHub's scheduler is not a clock: it delivers a
+# fraction of the runs it is asked for, hours late, and a run can only sleep to an
+# anchor if one was delivered beforehand. So each run sleeps to the next anchor,
+# pings, and starts the next run itself with workflow_dispatch, which is not
+# subject to the scheduler. The hourly cron below is only a restart if the relay
+# ever breaks.
 on:
   workflow_dispatch:
+    inputs:
+      chain:
+        description: "Run as part of the relay: wait for the next anchor rather than pinging now. Leave off to ping immediately."
+        type: boolean
+        default: false
+      dry_run:
+        description: "Plan and hand off, but never call Claude. For testing the relay."
+        type: boolean
+        default: false
+      hop_seconds:
+        description: "Longest one run sleeps before handing off. Only lower this to test the relay."
+        type: string
+        default: "19800"
   schedule:
-    - cron: '23 * * * *'   # hourly, off-peak minute; late/dropped fires are expected and absorbed
+    - cron: '23 * * * *'   # relay restart only; its delivery time does not matter
 
 permissions:
-  actions: read     # read this workflow's own run history — that is where state lives
+  actions: write    # read this workflow's run history, and dispatch the next run
   contents: read
 
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # MAXWAIT (5h45m) + overhead, just under the 6h hosted-runner cap
+    timeout-minutes: 355   # a run sleeps at most 5h30m (HOP) and then pings; the hosted-runner cap is 6h
     env:
       GH_TOKEN: ${{ github.token }}
-      # Madrid-local window anchors, spaced 5h01m. Exactly-5h spacing cannot
-      # work: each ping lands a moment late, so the next window start is pushed
-      # past the next anchor and the schedule walks forward every cycle.
-      #
-      # The extra minute is the safety margin, and it is deliberately not
-      # smaller. A ping that lands inside a still-open window does not open a
-      # new one, but `claude -p` still succeeds and the run still goes green, so
-      # the miss is invisible and the next target is then computed from an
-      # anchor that never existed. A margin of seconds only survives if the
-      # window is exactly 5h from the message; a minute also survives the window
-      # end rounding up to the next minute.
+      # Madrid-local anchors, 5h01m apart. Exactly five hours cannot work: each
+      # ping lands a moment after its anchor, so the next window could only open
+      # a moment after the next one. The extra minute is the margin, and it is
+      # not smaller on purpose: a ping inside a window that is still open opens
+      # nothing but still succeeds, so the miss leaves no trace.
       TARGETS: "03:00 08:01 13:02 18:03"
+      CHAIN: ${{ inputs.chain }}
+      DRY_RUN: ${{ inputs.dry_run }}
+      HOP_SECONDS: ${{ inputs.hop_seconds }}
 
     steps:
-      - name: Work out when to ping, then wait for it
+      - name: Plan
         id: plan
         run: |
           set -u
-          floor=18000   # 5h — a message sooner than this lands inside the still-open window
-          maxwait=20700 # 5h45m — longest a job may sleep, under the 6h runner cap
+          FLOOR=18000               # 5h: a message sooner than this lands inside the open window
+          LATE_MAX=5400             # 90m: an anchor is still worth serving this late, and no later
+          HOP=${HOP_SECONDS:-19800} # 5h30m: longest one run sleeps; a job may not live past 6h
+          PARENT_WAIT=120           # a relay run waits this long for the run that started it to finish
+          LEAD=30                   # re-check for a stray ping this long before the target
 
-          # Another run already awake means it is the one holding the next anchor.
-          others=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml \
-                     --status in_progress --json databaseId -q '.[].databaseId' \
-                   | grep -v "^${GITHUB_RUN_ID}$" || true)
-          if [ -n "$others" ] && [ "$GITHUB_EVENT_NAME" != "workflow_dispatch" ]; then
-            echo "Already in flight: $(echo "$others" | tr '\n' ' ')— nothing to do."
-            echo "ping=false" >> "$GITHUB_OUTPUT"; exit 0
+          fmt() { TZ=Europe/Madrid date -d "@$1" '+%a %d %H:%M:%S %Z'; }
+          out() { echo "$1" >> "$GITHUB_OUTPUT"; }
+          out "t0=$(date +%s)"
+
+          # Ids of the other runs of this workflow that are alive or about to be.
+          live_runs() {
+            local s
+            for s in in_progress queued; do
+              gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml --status "$s" \
+                --json databaseId -q '.[].databaseId' 2>/dev/null || true
+            done | grep -vx "$GITHUB_RUN_ID" || true
+          }
+          older_live() { live_runs | awk -v me="$GITHUB_RUN_ID" '$1 + 0 < me + 0'; }
+
+          # Epoch of the newest successful "Ping Claude" step in the recent run history,
+          # or 0. The history is the only state: nothing is written, so nothing can go
+          # stale, and no credential beyond the built-in token is needed. In-progress
+          # runs count, since the run that started this one may still be winding down.
+          last_ping() {
+            local id t
+            for id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml \
+                          --limit 40 --json databaseId -q '.[].databaseId' 2>/dev/null | grep -vx "$GITHUB_RUN_ID" || true); do
+              t=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
+                    -q '.jobs[].steps[] | select(.name=="Ping Claude" and .conclusion=="success") | .completed_at' \
+                    2>/dev/null | head -1 || true)
+              if [ -n "$t" ]; then date -d "$t" +%s; return; fi
+            done
+            echo 0
+          }
+
+          # A manual run pings now. A scheduled run stands aside if any run is alive.
+          # A relay run (started by the previous run) waits for that run to finish, and
+          # stands aside only for an older one that is still going.
+          manual=false
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "${CHAIN:-}" != true ]; then manual=true; fi
+
+          if [ "$manual" = false ]; then
+            if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+              alive=$(live_runs | tr '\n' ' ')
+              if [ -n "$alive" ]; then
+                echo "Run(s) $alive already alive — leaving it to them."
+                out "role=exit"; out "action=none"; exit 0
+              fi
+            else
+              deadline=$(( $(date +%s) + PARENT_WAIT ))
+              while [ -n "$(older_live)" ] && [ "$(date +%s)" -lt "$deadline" ]; do sleep 5; done
+              if [ -n "$(older_live)" ]; then
+                echo "An older run is still going — it holds the relay, so this one stands down."
+                out "role=exit"; out "action=none"; exit 0
+              fi
+            fi
           fi
-
-          # State is the run history itself: the newest run whose "Ping Claude"
-          # step actually succeeded. Nothing to store, nothing to corrupt, and no
-          # credential beyond the built-in token.
-          last=0
-          for id in $(gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml \
-                        --limit 15 --json databaseId -q '.[].databaseId' \
-                      | grep -v "^${GITHUB_RUN_ID}$"); do
-            t=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$id/jobs" \
-                  -q '.jobs[].steps[] | select(.name=="Ping Claude" and .conclusion=="success") | .completed_at' \
-                  2>/dev/null | head -1)
-            if [ -n "$t" ]; then last=$(date -d "$t" +%s); break; fi
-          done
+          out "role=survivor"
 
           now=$(date +%s)
+          last=$(last_ping)
+          floor_at=$(( last + FLOOR ))
 
-          # Absolute epochs for every anchor across yesterday/today/tomorrow, so
-          # "previous" and "next" both resolve correctly across midnight and DST.
-          # The day set is derived from $now rather than read from the clock
-          # again, so a run started a moment before midnight cannot end up with
-          # a "now" and a day window on opposite sides of the date change.
-          prev=0; next=0
+          # Every anchor from yesterday to tomorrow as an absolute epoch, so midnight
+          # and DST need no special case. The days come from $now, not a second read
+          # of the clock, so a run started just before midnight cannot split them.
           today=$(TZ=Europe/Madrid date -d "@$now" +%Y-%m-%d)
+          anchors=""
           for d in "-1 day" "+0 day" "+1 day"; do
             day=$(date -d "$today $d" +%Y-%m-%d)
             for hm in $TARGETS; do
-              t=$(TZ=Europe/Madrid date -d "$day $hm:00" +%s)
-              if   [ "$t" -le "$now" ] && { [ "$prev" -eq 0 ] || [ "$t" -gt "$prev" ]; }; then prev=$t
-              elif [ "$t" -gt "$now" ] && { [ "$next" -eq 0 ] || [ "$t" -lt "$next" ]; }; then next=$t
-              fi
+              anchors="$anchors $(TZ=Europe/Madrid date -d "$day $hm:00" +%s)"
             done
           done
 
-          echo "Madrid now      : $(TZ=Europe/Madrid date '+%Y-%m-%d %H:%M:%S %Z')"
-          if [ "$last" -gt 0 ]; then
-            echo "Last ping       : $(TZ=Europe/Madrid date -d "@$last" '+%Y-%m-%d %H:%M %Z')"
-          else
-            echo "Last ping       : none found in recent history"
+          # Serve the earliest anchor that can still be served within LATE_MAX of its
+          # time. A ping is never earlier than the anchor, than five hours after the
+          # last ping (it would open nothing), or than now. So a run delivered a few
+          # minutes late serves the anchor it missed; one delivered hours late skips
+          # that slot and waits for the next anchor rather than pinging at a useless
+          # hour and dragging every later anchor with it.
+          target=$now; anchor=0
+          if [ "$manual" = false ]; then
+            target=0
+            for a in $(printf '%s' "$anchors" | tr ' ' '\n' | sort -n); do
+              t=$a
+              if [ "$floor_at" -gt "$t" ]; then t=$floor_at; fi
+              if [ "$now" -gt "$t" ]; then t=$now; fi
+              if [ $(( t - a )) -le "$LATE_MAX" ]; then target=$t; anchor=$a; break; fi
+            done
+            if [ "$target" -eq 0 ]; then target=$now; fi
           fi
-          echo "Previous anchor : $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M')"
-          echo "Next anchor     : $(TZ=Europe/Madrid date -d "@$next" '+%H:%M')"
 
-          # A new window can only open once the last one has expired. Aim at the
-          # anchor, but never before that moment — a ping inside an open window
-          # does not start a new one, and skipping the anchor over a few minutes
-          # would forfeit the whole slot.
-          earliest=$(( last + floor ))
-          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
-            target=$now
+          echo "Now       : $(fmt "$now")"
+          if [ "$last" -gt 0 ]; then echo "Last ping : $(fmt "$last")"; else echo "Last ping : none in recent history"; fi
+          if [ "$manual" = true ]; then
             echo "Manual run — pinging now."
-          elif [ "$last" -lt "$prev" ]; then
-            target=$now
-            if [ "$earliest" -gt "$target" ]; then target=$earliest; fi
-            echo "Anchor $(TZ=Europe/Madrid date -d "@$prev" '+%H:%M') passed unserved — serving it at $(TZ=Europe/Madrid date -d "@$target" '+%H:%M:%S')."
           else
-            target=$next
-            if [ "$earliest" -gt "$target" ]; then target=$earliest; fi
-            echo "Aiming at $(TZ=Europe/Madrid date -d "@$target" '+%H:%M:%S %Z')."
+            echo "Serving   : the $(fmt "$anchor") anchor, $(( (target - anchor) / 60 )) min late, at $(fmt "$target")"
           fi
 
+          # The overnight gap is 8h57m and a job may live six hours, so one run cannot
+          # sleep through it. Sleep as far as is safe and hand off; the next run picks
+          # up the remainder. Each leg ends on an absolute target, so hand-off delay
+          # never accumulates.
           wait=$(( target - now ))
           if [ "$wait" -lt 0 ]; then wait=0; fi
-
-          # The overnight gap (18:03 -> 03:00) is 8h57m, longer than a job may
-          # live, so a run delivered early in it cannot sleep the whole way.
-          # Exit cheaply and let a later-delivered run cover it, rather than
-          # sleeping into the timeout and holding the lock the whole time.
-          if [ "$wait" -gt "$maxwait" ]; then
-            echo "Target is ${wait}s out, beyond the ${maxwait}s a job can wait — leaving it to a later run."
-            echo "ping=false" >> "$GITHUB_OUTPUT"; exit 0
+          if [ "$wait" -gt "$HOP" ]; then
+            echo "Target is ${wait}s away — sleeping ${HOP}s, then handing off."
+            sleep "$HOP"
+            out "action=hop"; exit 0
           fi
 
-          if [ "$wait" -gt 0 ]; then sleep "$wait"; fi
-          echo "ping=true" >> "$GITHUB_OUTPUT"
+          # Install the CLI now, not after waking, so the message goes out on the target.
+          if [ "$wait" -gt 60 ] && [ "${DRY_RUN:-}" != true ]; then
+            npm install -g @anthropic-ai/claude-code >/dev/null 2>&1 || echo "::warning::early install failed; the ping step will retry"
+          fi
+
+          lead=$(( target - LEAD - $(date +%s) ))
+          if [ "$lead" -gt 0 ]; then sleep "$lead"; fi
+
+          # A ping may have landed while we slept (a manual run, or a duplicate relay).
+          # If we are now inside its window, pinging would open nothing: replan instead.
+          if [ "$manual" = false ]; then
+            last2=$(last_ping)
+            if [ "$last2" -gt "$last" ] && [ $(( target - last2 )) -lt "$FLOOR" ]; then
+              echo "A ping landed at $(fmt "$last2") while we slept, so pinging now would open nothing — handing off to replan."
+              out "action=none"; exit 0
+            fi
+          fi
+
+          rest=$(( target - $(date +%s) ))
+          if [ "$rest" -gt 0 ]; then sleep "$rest"; fi
+
+          if [ "${DRY_RUN:-}" = true ]; then
+            echo "Dry run — would ping now."
+            out "action=dry"
+          else
+            out "action=ping"
+          fi
 
       - name: Ping Claude
-        if: steps.plan.outputs.ping == 'true'
+        id: ping
+        if: steps.plan.outputs.action == 'ping'
         env:
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           MAX_THINKING_TOKENS: "0"
         run: |
-          npm install -g @anthropic-ai/claude-code
+          if ! command -v claude >/dev/null 2>&1; then npm install -g @anthropic-ai/claude-code; fi
           for attempt in 1 2 3 4 5; do
             echo "Attempt ${attempt}/5 at $(TZ=Europe/Madrid date '+%H:%M:%S %Z')"
             if claude -p "hi" --model claude-haiku-4-5-20251001 \
@@ -144,4 +214,31 @@ jobs:
             sleep 60
           done
           echo "All 5 attempts failed."
+          exit 1
+
+      # Start the next run. Not on cancel: cancelling a run is how to stop the relay.
+      - name: Hand off
+        if: ${{ !cancelled() && steps.plan.outputs.role == 'survivor' }}
+        env:
+          PLAN_T0: ${{ steps.plan.outputs.t0 }}
+          PING_OUTCOME: ${{ steps.ping.outcome }}
+        run: |
+          # Never hand off faster than once a minute, so a plan that ends in seconds
+          # (a dry run, a catch-up) cannot turn the relay into a hot loop.
+          elapsed=$(( $(date +%s) - ${PLAN_T0:-0} ))
+          if [ "$elapsed" -lt 60 ]; then sleep $(( 60 - elapsed )); fi
+          if [ "${PING_OUTCOME:-}" = failure ]; then
+            echo "The ping failed — waiting ten minutes before the relay tries again."
+            sleep 600
+          fi
+          for attempt in 1 2 3; do
+            if gh workflow run claude.yml --repo "$GITHUB_REPOSITORY" --ref "$GITHUB_REF_NAME" \
+                 -f chain=true -f dry_run="${DRY_RUN:-false}" -f hop_seconds="${HOP_SECONDS:-19800}"; then
+              echo "Handed off to the next run."
+              exit 0
+            fi
+            echo "Dispatch attempt ${attempt} failed — retrying in 10s"
+            sleep 10
+          done
+          echo "::error::Could not start the next run. The hourly cron will restart the relay."
           exit 1
