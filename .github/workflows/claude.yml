@@ -10,9 +10,17 @@ name: Claude repeater
 # pings, and starts the next run itself with workflow_dispatch, which is not
 # subject to the scheduler. The hourly cron below is only a restart if the relay
 # ever breaks.
+# The run name is how an emergency pause is recorded: see `override` below.
+run-name: ${{ inputs.override == 'pause_24h' && 'PAUSE 24h' || inputs.override == 'resume' && 'RESUME' || 'Claude repeater' }}
+
 on:
   workflow_dispatch:
     inputs:
+      override:
+        description: "EMERGENCY. pause_24h: no pings for 24 hours from now, then it resumes by itself. resume: cancel a pause early. Leave on none for normal runs."
+        type: choice
+        options: [none, pause_24h, resume]
+        default: none
       chain:
         description: "Run as part of the relay: wait for the next anchor rather than pinging now. Leave off to ping immediately."
         type: boolean
@@ -44,6 +52,7 @@ jobs:
       # not smaller on purpose: a ping inside a window that is still open opens
       # nothing but still succeeds, so the miss leaves no trace.
       TARGETS: "03:00 08:01 13:02 18:03"
+      OVERRIDE: ${{ inputs.override }}
       CHAIN: ${{ inputs.chain }}
       DRY_RUN: ${{ inputs.dry_run }}
       HOP_SECONDS: ${{ inputs.hop_seconds }}
@@ -58,6 +67,8 @@ jobs:
           HOP=${HOP_SECONDS:-19800} # 5h30m: longest one run sleeps; a job may not live past 6h
           PARENT_WAIT=120           # a relay run waits this long for the run that started it to finish
           LEAD=30                   # re-check for a stray ping this long before the target
+          PAUSE_SECONDS=86400       # an emergency pause lasts exactly this long, then lifts itself
+          PAUSE_STEP=600            # while paused, look again this often so a resume takes effect quickly
 
           fmt() { TZ=Europe/Madrid date -d "@$1" '+%a %d %H:%M:%S %Z'; }
           out() { echo "$1" >> "$GITHUB_OUTPUT"; }
@@ -89,6 +100,34 @@ jobs:
             echo 0
           }
 
+          # The emergency pause is a run, not a stored value: a manual run with override
+          # set to pause_24h is named "PAUSE 24h", one set to resume is named "RESUME", and
+          # the newest of either decides. A pause is over 24 hours after that run was
+          # created, so it can never be forgotten. Needs no token and no commit.
+          # Prints the epoch the pause ends, or 0 if there is none.
+          pause_end() {
+            local row created end
+            row=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow claude.yml --limit 100 \
+                    --json displayTitle,createdAt \
+                    -q '[.[] | select(.displayTitle | test("^(PAUSE|RESUME)"))] | .[0] | "\(.displayTitle)|\(.createdAt)"' \
+                    2>/dev/null || true)
+            case "$row" in
+              PAUSE*)
+                created=$(date -d "${row#*|}" +%s)
+                end=$(( created + PAUSE_SECONDS ))
+                if [ "$end" -gt "$(date +%s)" ]; then echo "$end"; return; fi ;;
+            esac
+            echo 0
+          }
+
+          # An override run only records itself in the run history; it never holds the relay.
+          case "${OVERRIDE:-none}" in
+            pause_24h) echo "Pause recorded. No pings for 24 hours from this run's start; the relay stays alive and resumes on its own."
+                       out "role=exit"; out "action=none"; exit 0 ;;
+            resume)    echo "Resume recorded. Any pause is cancelled."
+                       out "role=exit"; out "action=none"; exit 0 ;;
+          esac
+
           # A manual run pings now. A scheduled run stands aside if any run is alive.
           # A relay run (started by the previous run) waits for that run to finish, and
           # stands aside only for an older one that is still going.
@@ -112,6 +151,28 @@ jobs:
             fi
           fi
           out "role=survivor"
+
+          # Emergency pause: stay alive and send nothing. The relay keeps being handed on, so
+          # it resumes on the first anchor after the pause with no restart. A manual
+          # run is a deliberate ping and ignores the pause.
+          if [ "$manual" = false ]; then
+            idled=0
+            while [ "$idled" -lt "$HOP" ]; do
+              pe=$(pause_end)
+              if [ "$pe" -le 0 ]; then break; fi
+              step=$(( pe - $(date +%s) ))
+              if [ "$step" -gt "$PAUSE_STEP" ]; then step=$PAUSE_STEP; fi
+              if [ "$step" -gt $(( HOP - idled )) ]; then step=$(( HOP - idled )); fi
+              if [ "$step" -lt 1 ]; then step=1; fi
+              echo "Paused until $(fmt "$pe") — idling ${step}s."
+              sleep "$step"
+              idled=$(( idled + step ))
+            done
+            if [ "$idled" -gt 0 ]; then
+              echo "Pause over or run budget spent — handing off so the next run plans afresh."
+              out "action=none"; exit 0
+            fi
+          fi
 
           now=$(date +%s)
           last=$(last_ping)
@@ -178,6 +239,10 @@ jobs:
           # A ping may have landed while we slept (a manual run, or a duplicate relay).
           # If we are now inside its window, pinging would open nothing: replan instead.
           if [ "$manual" = false ]; then
+            if [ "$(pause_end)" -gt 0 ]; then
+              echo "A pause was set while we slept — not pinging."
+              out "action=none"; exit 0
+            fi
             last2=$(last_ping)
             if [ "$last2" -gt "$last" ] && [ $(( target - last2 )) -lt "$FLOOR" ]; then
               echo "A ping landed at $(fmt "$last2") while we slept, so pinging now would open nothing — handing off to replan."

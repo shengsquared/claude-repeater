@@ -46,7 +46,7 @@ through it. Runs sleep at most 5h30m, then hand off, and the next run sleeps the
 rest. Each leg ends on an absolute target, so hand-off delay never accumulates.
 The 18:03 run hands off at 23:33 and the next one wakes for 03:00.
 
-Cancelling the live run stops the relay. That is the off switch.
+Cancelling the live run breaks the chain, but it is not an off switch: the next cron delivery starts the relay again, which can be minutes or hours later. To stop it for a day, use the emergency pause below.
 
 ## Which anchor a run serves
 
@@ -90,12 +90,35 @@ window and does nothing, and the extra run stands down at the next hand-off.
 A run also re-checks the history 30 seconds before its target. If a ping landed
 while it slept (a manual run, say), pinging would open nothing, so it replans.
 
+## Emergency pause
+
+To stop every ping for a day: **Actions, *Claude repeater*, Run workflow, set
+`override` to `pause_24h`.** The run that results is named `PAUSE 24h`, and for the
+next 24 hours from the moment you started it nothing is sent. Then it resumes by
+itself on the next anchor; nothing to remember, nothing to undo.
+
+- **Cancel it early:** run the workflow again with `override` set to `resume`.
+  Takes effect within ten minutes.
+- **Extend it:** run `pause_24h` again; the 24 hours restart from then.
+- The relay stays alive while paused. Runs keep handing on, idling, and send
+  nothing. That is why it resumes exactly on the next anchor with no restart.
+- A run about to ping looks again 30 seconds before its target, so a pause set
+  while a run sleeps is caught before the ping goes out.
+- A **manual** run (`chain` off) is a deliberate ping and ignores the pause.
+- The pause is recorded in the run history (the run's name and start time), so it
+  needs no token and writes nothing to the repo.
+
+To stop the workflow completely rather than pause it: cancel the run in progress and
+use *Disable workflow* in the Actions tab, which also stops the cron. Cancelling
+alone is not enough, because the hourly cron restarts the relay.
+
 ## Operating it
 
 - **Start or restart the relay:** Actions, *Claude repeater*, Run workflow, with
   `chain` ticked. It waits for the next anchor. Leave `chain` off to ping
   immediately instead.
-- **Stop it:** cancel the run that is in progress.
+- **Stop it for good:** cancel the run in progress *and* disable the workflow (see above).
+- **Pause it for a day:** see Emergency pause.
 - **Test it without spending anything:** run with `dry_run` ticked and
   `hop_seconds` set to `90`. It plans, sleeps, and hands off every minute and a
   half, and never calls Claude. Cancel it when done.
