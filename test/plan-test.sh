@@ -50,6 +50,13 @@ case "$*" in
       [ "$now" -lt "$until" ] && echo "$id"
     done; exit 0 ;;
   *"--status queued"*) exit 0 ;;
+  *displayTitle*)                # the pause lookup: newest PAUSE/RESUME run, "title|created"
+    row=""
+    if [ -n "${FAKE_PAUSE_AT:-}" ] && [ "$now" -ge "$FAKE_PAUSE_AT" ]; then
+      row="PAUSE 24h|$(/usr/bin/date -u -d "@$FAKE_PAUSE_AT" +%Y-%m-%dT%H:%M:%SZ)"; fi
+    if [ -n "${FAKE_RESUME_AT:-}" ] && [ "$now" -ge "$FAKE_RESUME_AT" ]; then
+      row="RESUME|$(/usr/bin/date -u -d "@$FAKE_RESUME_AT" +%Y-%m-%dT%H:%M:%SZ)"; fi
+    echo "${row:-null|null}"; exit 0 ;;
   *"run list"*) [ -n "${FAKE_LAST:-}" ] && echo 1; exit 0 ;;
   *api*)
     l="${FAKE_LAST:-}"
@@ -126,6 +133,43 @@ LIVE_IDS="1001" t "relay run ignores a newer run"    "2026-09-21 12:00:00" "2026
 echo "a ping lands while the run sleeps"
 FAKE_LAST_LATE=$(mad '2026-09-21 05:00:00') FAKE_LATE_AT=$(mad '2026-09-21 05:00:01') \
   t "it would open nothing: replan, do not ping" "2026-09-21 03:05:00" "2026-09-21 03:00:08" "survivor/none @ Sep21 08:00:30"
+
+echo "emergency pause (a PAUSE run in the history holds every ping for 24 hours)"
+FAKE_PAUSE_AT=$(mad '2026-10-04 23:00:00') \
+  t "paused at start: idles, hands off at the run budget"  "2026-10-04 23:07:00" "2026-10-04 18:03:08" "survivor/none @ Oct05 04:37:00"
+FAKE_PAUSE_AT=$(mad '2026-10-04 12:00:00') \
+  t "the pause lifts itself 24h after it was set"          "2026-10-05 11:50:00" "2026-10-04 08:01:08" "survivor/none @ Oct05 12:00:00"
+FAKE_PAUSE_AT=$(mad '2026-10-04 12:00:00') FAKE_RESUME_AT=$(mad '2026-10-04 12:30:00') \
+  t "a RESUME run cancels it within 10 min"                "2026-10-04 12:20:00" "2026-10-04 08:01:08" "survivor/none @ Oct04 12:30:00"
+FAKE_PAUSE_AT=$(mad '2026-10-03 12:00:00') \
+  t "a pause older than 24h is ignored"                    "2026-10-04 13:00:00" "2026-10-04 08:01:08" "survivor/ping @ Oct04 13:02:00"
+FAKE_PAUSE_AT=$(mad '2026-10-04 06:00:00') \
+  t "set while a run sleeps: caught before it pings"       "2026-10-04 03:05:00" "2026-10-04 03:00:08" "survivor/none @ Oct04 08:00:30"
+FAKE_PAUSE_AT=$(mad '2026-10-04 12:00:00') EV=workflow_dispatch CHAIN=false \
+  t "a manual run is deliberate and ignores the pause"     "2026-10-04 13:00:00" "2026-10-04 08:01:08" "survivor/ping @ Oct04 13:00:00"
+OVERRIDE=pause_24h t "the pause run only records itself"   "2026-10-04 13:00:00" "2026-10-04 08:01:08" "exit/none @ Oct04 13:00:00"
+OVERRIDE=resume    t "the resume run only records itself"  "2026-10-04 13:00:00" "2026-10-04 08:01:08" "exit/none @ Oct04 13:00:00"
+
+echo "the pause lookup's jq filter, run for real (the gh stub above bypasses it)"
+FILTER=$(grep -o "\-q '\[.*" "$WF" | head -1 | sed "s/^-q '//; s/' \\\\\$//; s/'\$//")
+jqcase() { # desc json expected
+  local got; got=$(jq -r "$FILTER" <<<"$2" 2>&1)
+  if [ "$got" = "$3" ]; then pass=$((pass+1)); printf '  ok   %-52s %s\n' "$1" "$got"
+  else fail=$((fail+1)); printf '  FAIL %-52s got  %s\n       %52s want %s\n' "$1" "$got" "" "$3"; fi
+}
+if command -v jq >/dev/null; then
+  N='{"displayTitle":"Claude repeater","createdAt":"2026-10-04T12:00:00Z"}'
+  P='{"displayTitle":"PAUSE 24h","createdAt":"2026-10-04T11:00:00Z"}'
+  R='{"displayTitle":"RESUME","createdAt":"2026-10-04T13:00:00Z"}'
+  P2='{"displayTitle":"PAUSE 24h","createdAt":"2026-10-04T14:00:00Z"}'
+  jqcase "no pause or resume in the history"        "[$N]"          "null|null"
+  jqcase "empty history"                            "[]"            "null|null"
+  jqcase "a pause among normal runs"                "[$N,$P,$N]"    "PAUSE 24h|2026-10-04T11:00:00Z"
+  jqcase "a resume newer than the pause wins"       "[$R,$N,$P]"    "RESUME|2026-10-04T13:00:00Z"
+  jqcase "a second pause newer than the resume wins" "[$P2,$R,$P]"  "PAUSE 24h|2026-10-04T14:00:00Z"
+else
+  echo "  (jq not installed: skipping the filter checks)"
+fi
 
 echo "midnight and DST"
 t "second before midnight"                  "2026-09-21 23:59:59" "2026-09-21 18:03:05" "survivor/ping @ Sep22 03:00:00"
